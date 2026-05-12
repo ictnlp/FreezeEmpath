@@ -1,0 +1,8 @@
+{"text": "餐厅收了我没吃过的菜的钱！", "audio": "examples/audio/VStyle-empathy/anger/634_Achernar.wav", "emotion": "anger"}
+{"text": "我听说下季度整个部门都会裁员。", "audio": "examples/audio/VStyle-empathy/anxiety_fear/691_Iapetus.wav", "emotion": "fear"}
+{"text": "我为演讲付出了很多努力，但似乎没人注意到。", "audio": "examples/audio/VStyle-empathy/sadness_disappointment/716_Zephyr.wav", "emotion": "disappointment"}
+{"text": "我们订好票了，要去环游欧洲一个月！", "audio": "examples/audio/VStyle-empathy/joy_excitement/734_Vindemiatrix.wav", "emotion": "excitement"}
+{"text": "Generate a positive remark that can be used to match the following post. The day started off feeling like a drag, but I'm determined to make the best out of it.", "audio": "examples/audio/SpeechAlpaca/00000-en-US-JennyNeural-cheerful.wav", "emotion": "cheerful"}
+{"text": "What are the important contributions of NASA to space exploration?", "audio": "examples/audio/SpeechAlpaca/00115-en-US-GuyNeural-neutral.wav", "emotion": "neutral"}
+{"text": "Generate a list of three actions that can be taken in order to reduce the amount of waste produced.", "audio": "examples/audio/SpeechAlpaca/00203-en-US-JasonNeural-sad.wav", "emotion": "sad"}
+{"text": "What type of error will occur if a program is not working as expected?", "audio": "examples/audio/SpeechAlpaca/00392-en-US-NancyNeural-angry.wav", "emotion": "angry"}
