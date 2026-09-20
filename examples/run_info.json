@@ -1,0 +1,27 @@
+{
+  "date": "2026-09-20",
+  "python": "3.10.0",
+  "transformers": "4.43.4",
+  "model_revision": "abeaefaeb36a6364837f832ef8fe4b9e10f99f17",
+  "decoder_revision": "2c346af2fdab3338cd13418c96e10f68cf28fb14",
+  "response_generation": {
+    "samples": 8,
+    "seed": 42,
+    "temperature": 0.7,
+    "max_new_tokens": 256,
+    "gpu": "NVIDIA H800",
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "elapsed_seconds_including_load": 378.97,
+    "peak_allocated_gib": 17.92,
+    "peak_reserved_gib": 19.46
+  },
+  "waveform_decoding": {
+    "samples": 8,
+    "seed": 42,
+    "elapsed_seconds_including_load": 44.1,
+    "peak_allocated_gib": 1.79,
+    "peak_reserved_gib": 4.1
+  },
+  "notes": "Existing checkpoints and conda environment; HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1. Times include loading and are not a latency benchmark."
+}

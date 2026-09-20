@@ -1,178 +1,151 @@
+"""Generate empathetic responses from a JSONL audio manifest (one utterance at a time)."""
 import argparse
-import torch
-import os
-import sys
 import json
+from pathlib import Path
+import sys
+import time
+import warnings
+
+import torch
 import whisper
-
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoTokenizer, set_seed
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-sys.path.append(parent_dir)
-sys.path.append(os.path.join(parent_dir, 'datasets'))
-
-
-from model import *
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from model import Omni2Speech2SQwen2ForCausalLM, Omni2SpeechQwen2ForCausalLM
 from constants import SPEECH_TOKEN_INDEX, DEFAULT_SPEECH_TOKEN, EMOTION_TOKEN_INDEX, DEFAULT_EMOTION_TOKEN
-from torch.utils.data import Dataset, DataLoader
+
+SYSTEM_PROMPT = (
+    "You are an empathetic spoken chatbot. Please provide a very short but helpful "
+    "response to the user with empathy toward the user's emotional tone."
+)
 
 
-class MultiturnSpeechDataset(Dataset):
-    def __init__(self, questions, tokenizer, model_config):
-        self.questions = questions
-        self.tokenizer = tokenizer
-        self.model_config = model_config
-    
-    def load_speech(self, path):
-        speech = whisper.load_audio(path)
-        speech = whisper.pad_or_trim(speech)
-        speech = whisper.log_mel_spectrogram(speech, n_mels=128).permute(1, 0).bfloat16().to('cuda')
-
-        return speech
-
-    def process_messages(self, messages):
-        input_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")[0]
-        input_ids[input_ids == self.tokenizer.convert_tokens_to_ids(DEFAULT_SPEECH_TOKEN)] = SPEECH_TOKEN_INDEX
-        input_ids[input_ids == self.tokenizer.convert_tokens_to_ids(DEFAULT_EMOTION_TOKEN)] = EMOTION_TOKEN_INDEX
-        return input_ids
-
-    def __getitem__(self, index):
-        item = self.questions[index]
-        messages = []
-        speech_list = []
-
-        messages.append({
-            "role": "system",
-            "content": f"You are an empathetic spoken chatbot. Please provide a very short but helpful response to the user with empathy toward the user's emotional tone.",
-        })
-
-        messages.append({
-            "role": "user",
-            "content": f"{DEFAULT_SPEECH_TOKEN}(with a {DEFAULT_EMOTION_TOKEN} emotional tone).",
-        })
-
-        speech = self.load_speech(item["audio"])
-        speech_list.append(speech)
-        
-        input_ids = self.process_messages(messages)
-        return {
-            "input_ids": input_ids,
-            "speech": speech_list
-        }
-
-    def __len__(self):
-        return len(self.questions)
+def read_questions(path):
+    path = Path(path).expanduser().resolve()
+    questions = []
+    with path.open(encoding="utf-8") as stream:
+        for number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{number}: invalid JSON: {exc.msg}") from exc
+            if not isinstance(item, dict) or not isinstance(item.get("audio"), str):
+                raise ValueError(f"{path}:{number}: expected an object with an 'audio' path")
+            audio = Path(item["audio"]).expanduser()
+            # Keep compatibility with the repository's existing manifests.
+            if not audio.is_absolute() and not audio.is_file():
+                audio = path.parent / audio
+            if not audio.is_file():
+                raise FileNotFoundError(f"{path}:{number}: audio not found: {item['audio']}")
+            questions.append((item, audio.resolve()))
+    if not questions:
+        raise ValueError(f"No audio examples found in {path}")
+    return questions
 
 
-
-def collate_fn(batch):
-    input_ids = [instance["input_ids"] for instance in batch]
-    all_speech = [speech for instance in batch for speech in instance["speech"]]
-    input_ids = torch.stack(input_ids, dim=0)
-    speech_tensors = torch.nn.utils.rnn.pad_sequence(
-        all_speech,
-        batch_first=True,
-        padding_value=0
-    )
-    speech_lengths = torch.LongTensor([len(speech) for speech in all_speech])
-    return input_ids, speech_tensors, speech_lengths
-
-
-def create_data_loader(questions, tokenizer, model_config, input_type, mel_size, batch_size=1, num_workers=0):
-    assert batch_size == 1, "batch_size must be 1"
-    dataset = MultiturnSpeechDataset(questions, tokenizer, model_config)
-    data_loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=collate_fn)
-    return data_loader
-
-
-def load_pretrained_model(model_path, s2s=False):
+def load_pretrained_model(model_path, speech_encoder, s2s):
+    model_path = Path(model_path).expanduser().resolve()
+    if not (model_path / "config.json").is_file():
+        raise FileNotFoundError(f"Missing {model_path / 'config.json'}. Run scripts/download_models.py first.")
+    config = AutoConfig.from_pretrained(str(model_path))
+    # Older released configs contain a path relative to the development project.
+    config.speech_encoder = speech_encoder
+    config.tts_tokenizer = str(model_path / "tts_tokenizer")
+    if s2s and not (model_path / "tts_tokenizer" / "tokenizer_config.json").is_file():
+        raise FileNotFoundError("The model download must include the tts_tokenizer/ directory.")
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path), use_fast=False)
     model_cls = Omni2Speech2SQwen2ForCausalLM if s2s else Omni2SpeechQwen2ForCausalLM
-    config = AutoConfig.from_pretrained(model_path)
-    config.tts_tokenizer = os.path.join(model_path, "tts_tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-    model = model_cls.from_pretrained(model_path, config=config, torch_dtype=torch.bfloat16)
-    model.cuda()
-    return tokenizer, model
+    model = model_cls.from_pretrained(str(model_path), config=config, torch_dtype=torch.bfloat16)
+    return tokenizer, model.cuda().eval()
 
 
 def eval_model(args):
-    # Model
-    model_path = os.path.expanduser(args.model_path)
-    tokenizer, model = load_pretrained_model(model_path, s2s=args.s2s)
-
-    questions = []
-    with open(args.question_file, "r") as f:
-        for line in f:
-            questions.append(json.loads(line.strip()))
-    answers_file = os.path.expanduser(args.answer_file)
-    os.makedirs(os.path.dirname(answers_file), exist_ok=True)
-    ans_file = open(answers_file, "w", encoding="utf-8")
-
-    data_loader = create_data_loader(questions, tokenizer, model.config, args.input_type, args.mel_size)
-
-    for (input_ids, speech_tensor, speech_lengths), item in tqdm(zip(data_loader, questions), total=len(questions)):
-        idx = item["id"] if "id" in item else item["audio"]
-        input_ids = input_ids.to(device='cuda', non_blocking=True)
-        speech_tensor = speech_tensor.to(dtype=torch.bfloat16, device='cuda', non_blocking=True)
-        speech_lengths = speech_lengths.to(device='cuda', non_blocking=True)
-
-        with torch.inference_mode():
+    questions = read_questions(args.question_file)
+    if args.max_samples:
+        questions = questions[:args.max_samples]
+    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+        raise RuntimeError("Inference requires an NVIDIA GPU with CUDA and BF16 support.")
+    set_seed(args.seed)
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    tokenizer, model = load_pretrained_model(args.model_path, args.speech_encoder, args.s2s)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"{DEFAULT_SPEECH_TOKEN}(with a {DEFAULT_EMOTION_TOKEN} emotional tone)."},
+    ]
+    input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+    for token, index in [(DEFAULT_SPEECH_TOKEN, SPEECH_TOKEN_INDEX), (DEFAULT_EMOTION_TOKEN, EMOTION_TOKEN_INDEX)]:
+        if token not in tokenizer.get_vocab():
+            raise ValueError(f"Checkpoint tokenizer is missing {token}")
+        input_ids[input_ids == tokenizer.convert_tokens_to_ids(token)] = index
+    input_ids = input_ids.cuda()
+    output_path = Path(args.answer_file).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as output:
+        for item, audio_path in tqdm(questions, desc="Generating responses"):
+            audio = whisper.load_audio(str(audio_path))
+            if len(audio) > whisper.audio.N_SAMPLES:
+                warnings.warn(f"{item['audio']}: only the first 30 seconds will be used.")
+            mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(audio), n_mels=128)
+            speech = mel.T.unsqueeze(0).to(device="cuda", dtype=torch.bfloat16)
+            lengths = torch.tensor([speech.shape[1]], device="cuda")
+            with torch.inference_mode():
+                result = model.generate(
+                    input_ids, attention_mask=torch.ones_like(input_ids),
+                    speech=speech, speech_lengths=lengths,
+                    do_sample=args.temperature > 0,
+                    temperature=args.temperature if args.temperature > 0 else None,
+                    top_p=args.top_p, top_k=args.top_k, num_beams=1,
+                    max_new_tokens=args.max_new_tokens, use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            output_ids, units = result if args.s2s else (result, None)
+            prediction = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            record = {"question_id": item.get("id", item["audio"]), "audio": item["audio"], "prediction": prediction}
             if args.s2s:
-                outputs = model.generate(
-                    input_ids,
-                    speech=speech_tensor,
-                    speech_lengths=speech_lengths,
-                    do_sample=True if args.temperature > 0 else False,
-                    temperature=args.temperature if args.temperature > 0 else None,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    num_beams=args.num_beams,
-                    max_new_tokens=args.max_new_tokens,
-                    use_cache=True,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                output_ids, output_units = outputs
-            else:
-                outputs = model.generate(
-                    input_ids,
-                    speech=speech_tensor,
-                    speech_lengths=speech_lengths,
-                    do_sample=True if args.temperature > 0 else False,
-                    temperature=args.temperature if args.temperature > 0 else None,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    num_beams=args.num_beams,
-                    max_new_tokens=args.max_new_tokens,
-                    use_cache=True,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                output_ids = outputs
+                record["prediction_units"] = units
+            output.write(json.dumps(record, ensure_ascii=False) + "\n")
+            output.flush()
+    torch.cuda.synchronize()
+    metrics = {
+        "samples": len(questions), "seed": args.seed, "temperature": args.temperature,
+        "max_new_tokens": args.max_new_tokens, "gpu": torch.cuda.get_device_name(),
+        "torch": torch.__version__, "cuda": torch.version.cuda,
+        "elapsed_seconds_including_load": round(time.perf_counter() - started, 2),
+        "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / 2**30, 2),
+    }
+    output_path.with_suffix(".metrics.json").write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    print(f"Saved {len(questions)} responses to {output_path}")
+    print(json.dumps(metrics, indent=2))
 
-        output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
-        if args.s2s:
-            ans_file.write(json.dumps({"question_id": idx, "prediction": output_text, "prediction_units": output_units}, ensure_ascii=False) + "\n")
-        else:
-            ans_file.write(json.dumps({"question_id": idx, "prediction": output_text}, ensure_ascii=False) + "\n")
-    
-    ans_file.close()
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model_path", default="checkpoints/FreezeEmpath")
+    parser.add_argument("--speech_encoder", default="large-v3", help="Whisper model name or path to large-v3.pt")
+    parser.add_argument("--question_file", default="examples/manifest.jsonl")
+    parser.add_argument("--answer_file", default="outputs/answers.jsonl")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--num_beams", type=int, choices=[1], default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_samples", type=int, default=None)
+    # Compatibility with the original CLI; only this frontend matches the checkpoint.
+    parser.add_argument("--input_type", choices=["mel"], default="mel")
+    parser.add_argument("--mel_size", type=int, choices=[128], default=128)
+    parser.add_argument("--s2s", action="store_true", help="Generate speech tokens as well as text")
+    args = parser.parse_args()
+    if args.temperature < 0 or args.max_new_tokens < 1 or (args.max_samples is not None and args.max_samples < 1):
+        parser.error("temperature must be nonnegative; max_new_tokens and max_samples must be positive")
+    return args
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str)
-    parser.add_argument("--question_file", type=str)
-    parser.add_argument("--answer_file", type=str)
-    parser.add_argument("--temperature", type=float, default=0)
-    parser.add_argument("--top_p", type=float, default=None)
-    parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--num_beams", type=int, default=1)
-    parser.add_argument("--max_new_tokens", type=int, default=4096)
-    parser.add_argument("--input_type", type=str, default="mel")
-    parser.add_argument("--mel_size", type=int, default=128)
-    parser.add_argument("--s2s", action="store_true", default=False)
-    args = parser.parse_args()
-
-    eval_model(args)
+    eval_model(parse_args())

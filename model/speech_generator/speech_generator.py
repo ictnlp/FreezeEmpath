@@ -179,6 +179,7 @@ class LLMSpeechGenerator(nn.Module):
         with torch.no_grad():
             outputs = self.model.generate(
                 inputs_embeds=tts_inputs.unsqueeze(0),
+                attention_mask=torch.ones((1, tts_inputs.size(0)), dtype=torch.long, device=tts_inputs.device),
                 do_sample=True,
                 temperature=1.0,
                 top_p=1.0,

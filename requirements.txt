@@ -1,0 +1,15 @@
+# Install the matching CUDA builds of torch/torchaudio first; see README.md.
+torch==2.8.0
+torchaudio==2.8.0
+# Custom generation code uses the Transformers 4.43 interfaces.
+transformers==4.43.4
+openai-whisper==20250625
+huggingface-hub==0.36.2
+safetensors>=0.5.3,<0.9
+numpy>=1.26.2,<2
+librosa==0.10.2.post1
+omegaconf==2.3.0
+einops==0.8.1
+munch==4.0.0
+soundfile==0.13.1
+descript-audiotools==0.7.4
